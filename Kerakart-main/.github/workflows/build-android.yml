@@ -1,0 +1,82 @@
+name: Build Kerakart APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+permissions:
+  contents: read
+concurrency:
+  group: kerakart-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Get repository
+        uses: actions/checkout@v4
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.35.7'
+          channel: stable
+          cache: true
+      - name: Find project or unpack uploaded ZIP
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, shutil, zipfile
+          repo = pathlib.Path(os.environ['GITHUB_WORKSPACE'])
+          stage = pathlib.Path(os.environ['RUNNER_TEMP']) / 'kerakart-build'
+          def locate(root):
+              matches = [p.parent for p in root.rglob('pubspec.yaml') if 'name: kerakart' in p.read_text()]
+              if len(matches) > 1:
+                  raise SystemExit('More than one Kerakart project found. Keep just one project or one ZIP in the repository.')
+              return matches[0] if matches else None
+          source = locate(repo)
+          if source is None:
+              archives = sorted(repo.glob('*kerakart*.zip')) + sorted(repo.glob('*Kerakart*.zip'))
+              archives = list(dict.fromkeys(archives))
+              if len(archives) != 1:
+                  raise SystemExit('Upload exactly one kerakart-flutter.zip at the repository root, or upload the extracted project files.')
+              unpacked = pathlib.Path(os.environ['RUNNER_TEMP']) / 'kerakart-unpacked'
+              unpacked.mkdir(exist_ok=True)
+              with zipfile.ZipFile(archives[0]) as archive:
+                  for item in archive.infolist():
+                      target = (unpacked / item.filename).resolve()
+                      if not target.is_relative_to(unpacked.resolve()):
+                          raise SystemExit('Invalid path in source ZIP')
+                  archive.extractall(unpacked)
+              source = locate(unpacked)
+          if source is None:
+              raise SystemExit('Kerakart pubspec.yaml was not found')
+          shutil.copytree(source, stage, dirs_exist_ok=True, ignore=shutil.ignore_patterns('.git', '.dart_tool', 'build', '*.zip'))
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              env.write(f'PROJECT_DIR={stage}\n')
+          PY
+      - name: Generate native Android project and apply branding
+        run: |
+          cd "$PROJECT_DIR"
+          dart tool/bootstrap.dart
+          flutter pub get
+      - name: Analyze and test
+        run: |
+          cd "$PROJECT_DIR"
+          flutter analyze
+          flutter test
+      - name: Build installable demo APK
+        run: |
+          cd "$PROJECT_DIR"
+          flutter build apk --release
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kerakart-Android-APK
+          path: ${{ env.PROJECT_DIR }}/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+          retention-days: 14
